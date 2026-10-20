@@ -19,7 +19,10 @@ ddb = boto3.resource("dynamodb")
 slots = ddb.Table(os.environ["SLOTS_TABLE"])
 reservations = ddb.Table(os.environ["RES_TABLE"])
 STRIPE_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
-WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+# No Stripe key -> mock gateway: a simulated hosted checkout page that delivers
+# Stripe-format, HMAC-signed webhooks to our own /webhook endpoint.
+MOCK_PAYMENTS = not STRIPE_KEY
+WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "") or ("whsec_mock_demo_secret" if MOCK_PAYMENTS else "")
 # Stripe Checkout sessions live at least 30 min; hold the lock a bit longer than that.
 SESSION_TTL = 1800
 LOCK_TTL = SESSION_TTL + 120
@@ -121,6 +124,80 @@ def stripe_checkout(reservation_id, slot, base_url):
         return json.loads(r.read())
 
 
+def mock_checkout(reservation_id, base_url):
+    return {"id": f"cs_mock_{uuid.uuid4().hex[:24]}", "url": f"{base_url}/mock-checkout/{reservation_id}"}
+
+
+def sign_and_deliver_webhook(event_type, r, base_url, paid):
+    """Act as the payment gateway: POST a signed Stripe-format event to our public /webhook."""
+    payload = json.dumps({
+        "id": f"evt_mock_{uuid.uuid4().hex[:24]}", "type": event_type, "created": int(time.time()),
+        "data": {"object": {
+            "id": r.get("checkoutSessionId"), "object": "checkout.session",
+            "payment_status": "paid" if paid else "unpaid",
+            "payment_intent": f"pi_mock_{uuid.uuid4().hex[:24]}" if paid else None,
+            "amount_total": int(r["amountInr"]) * 100, "currency": "inr",
+            "client_reference_id": r["reservationId"],
+            "metadata": {"reservationId": r["reservationId"], "slotId": r["slotId"]},
+        }},
+    })
+    ts = str(int(time.time()))
+    sig = hmac.new(WEBHOOK_SECRET.encode(), f"{ts}.{payload}".encode(), hashlib.sha256).hexdigest()
+    req = urllib.request.Request(f"{base_url}/webhook", data=payload.encode(), headers={
+        "Content-Type": "application/json", "Stripe-Signature": f"t={ts},v1={sig}"})
+    with urllib.request.urlopen(req, timeout=8) as w:
+        return w.status, json.loads(w.read())
+
+
+MOCK_PAGE = """<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Checkout (simulated)</title><style>
+body{font-family:system-ui,sans-serif;background:#f6f9fc;margin:0;padding:24px;color:#1a1f36}
+.card{max-width:420px;margin:auto;background:#fff;border-radius:12px;padding:24px;box-shadow:0 4px 16px #0001}
+.banner{background:#fff4d6;border:1px solid #f0c36d;padding:8px 12px;border-radius:8px;font-size:13px}
+.amt{font-size:32px;font-weight:600;margin:16px 0 4px}input{width:100%;box-sizing:border-box;padding:10px;
+border:1px solid #ccd;border-radius:6px;margin:6px 0 12px;font-size:15px}button{width:100%;padding:12px;border:0;
+border-radius:6px;font-size:16px;cursor:pointer;margin-top:6px}.pay{background:#635bff;color:#fff}.cancel{background:#eee}
+pre{background:#f0f2f5;padding:10px;border-radius:6px;white-space:pre-wrap;font-size:12px}</style></head><body>
+<div class=card><div class=banner>SIMULATED PAYMENT GATEWAY (demo mode, no real money). Webhooks are Stripe-format and HMAC-signed.</div>
+<div class=amt>&#8377;__AMOUNT__.00</div><div>Parking slot <b>__SLOT__</b> &middot; reservation <code>__RID__</code></div>
+<div>Status: <b id=st>__STATUS__</b> &middot; lock expires in <b id=ttl>__TTL__</b>s</div><br>
+<label>Card number</label><input id=card value="4242 4242 4242 4242">
+<small>4242&hellip; succeeds &middot; 4000 0000 0000 0002 is declined</small>
+<button class=pay onclick="go('pay')">Pay &#8377;__AMOUNT__</button><button class=cancel onclick="go('cancel')">Cancel / let session expire</button>
+<pre id=out></pre></div><script>
+let t=__TTL__;setInterval(()=>{if(t>0)document.getElementById('ttl').textContent=--t},1000);
+async function go(a){document.getElementById('out').textContent='Processing...';
+const r=await fetch(location.pathname+'/'+a,{method:'POST',body:JSON.stringify({card:document.getElementById('card').value})});
+const j=await r.json();document.getElementById('out').textContent=JSON.stringify(j,null,2);
+if(j.reservation)document.getElementById('st').textContent=j.reservation.status}</script></body></html>"""
+
+
+def mock_checkout_page(rid):
+    r = reservations.get_item(Key={"reservationId": rid}).get("Item")
+    if not r:
+        return resp(404, {"error": "checkout session not found"})
+    ttl = max(int(r["lockExpiresAt"]) - int(time.time()), 0)
+    html = (MOCK_PAGE.replace("__AMOUNT__", str(r["amountInr"])).replace("__SLOT__", r["slotId"])
+            .replace("__RID__", rid).replace("__STATUS__", r["status"]).replace("__TTL__", str(ttl)))
+    return {"statusCode": 200, "headers": {"Content-Type": "text/html"}, "body": html}
+
+
+def mock_checkout_action(event, rid, action, base_url):
+    r = reservations.get_item(Key={"reservationId": rid}).get("Item")
+    if not r:
+        return resp(404, {"error": "checkout session not found"})
+    if r["status"] != "PENDING_PAYMENT":
+        return resp(409, {"error": f"session already finished: {r['status']}", "reservation": r})
+    card = json.loads(read_body(event) or "{}").get("card", "").replace(" ", "")
+    if action == "pay" and card.startswith("4000000000000002"):
+        return resp(402, {"error": "card_declined", "message": "Your card was declined. Slot stays locked; try again.",
+                          "reservation": r})
+    event_type = "checkout.session.completed" if action == "pay" else "checkout.session.expired"
+    status, ack = sign_and_deliver_webhook(event_type, r, base_url, paid=action == "pay")
+    return resp(200, {"gateway": f"delivered {event_type} to {base_url}/webhook", "webhookResponse": [status, ack],
+                      "reservation": reservations.get_item(Key={"reservationId": rid})["Item"]})
+
+
 def verify_stripe_signature(body, header, tolerance=300):
     parts = {}
     for item in header.split(","):
@@ -134,6 +211,11 @@ def verify_stripe_signature(body, header, tolerance=300):
 
 
 # ---------- Handlers ----------
+def read_body(event):
+    body = event.get("body") or ""
+    return base64.b64decode(body).decode() if event.get("isBase64Encoded") else body
+
+
 def resp(code, body):
     return {"statusCode": code, "headers": {"Content-Type": "application/json"}, "body": json.dumps(body, default=str)}
 
@@ -156,7 +238,7 @@ def list_slots(_event):
 
 
 def reserve(event, base_url):
-    body = json.loads(event.get("body") or "{}")
+    body = json.loads(read_body(event) or "{}")
     slot_id, user_id = body.get("slotId"), body.get("userId")
     if not slot_id or not user_id:
         return resp(400, {"error": "slotId and userId required"})
@@ -177,13 +259,8 @@ def reserve(event, base_url):
         "status": "PENDING_PAYMENT", "amountInr": slot["priceInr"], "createdAt": now,
         "lockExpiresAt": now + LOCK_TTL,
     })
-    if not STRIPE_KEY:
-        release_lock(slot_id, reservation_id)
-        reservations.update_item(Key={"reservationId": reservation_id}, UpdateExpression="SET #s = :s",
-                                 ExpressionAttributeNames={"#s": "status"}, ExpressionAttributeValues={":s": "FAILED"})
-        return resp(500, {"error": "STRIPE_SECRET_KEY not configured"})
     try:
-        session = stripe_checkout(reservation_id, slot, base_url)
+        session = mock_checkout(reservation_id, base_url) if MOCK_PAYMENTS else stripe_checkout(reservation_id, slot, base_url)
     except Exception as e:
         release_lock(slot_id, reservation_id)
         detail = e.read().decode() if hasattr(e, "read") else str(e)
@@ -192,11 +269,12 @@ def reserve(event, base_url):
     reservations.update_item(Key={"reservationId": reservation_id}, UpdateExpression="SET checkoutSessionId = :c",
                              ExpressionAttributeValues={":c": session["id"]})
     return resp(201, {"reservationId": reservation_id, "slotId": slot_id, "lockTtlSec": LOCK_TTL,
-                      "checkoutUrl": session["url"], "checkoutSessionId": session["id"]})
+                      "checkoutUrl": session["url"], "checkoutSessionId": session["id"],
+                      "paymentProvider": "mock-stripe" if MOCK_PAYMENTS else "stripe"})
 
 
 def release(event):
-    rid = json.loads(event.get("body") or "{}").get("reservationId")
+    rid = json.loads(read_body(event) or "{}").get("reservationId")
     r = reservations.get_item(Key={"reservationId": rid}).get("Item") if rid else None
     if not r:
         return resp(404, {"error": "reservation not found"})
@@ -225,9 +303,7 @@ def set_status(rid, status, expected):
 
 
 def webhook(event):
-    body = event.get("body") or ""
-    if event.get("isBase64Encoded"):
-        body = base64.b64decode(body).decode()
+    body = read_body(event)
     sig = (event.get("headers") or {}).get("stripe-signature", "")
     if not WEBHOOK_SECRET or not verify_stripe_signature(body, sig):
         return resp(400, {"error": "invalid signature"})
@@ -271,6 +347,12 @@ def handler(event, _context):
             return get_reservation(path.rsplit("/", 1)[1])
         if method == "POST" and path == "/webhook":
             return webhook(event)
+        if MOCK_PAYMENTS and path.startswith("/mock-checkout/"):
+            parts = path.split("/")[2:]
+            if method == "GET" and len(parts) == 1:
+                return mock_checkout_page(parts[0])
+            if method == "POST" and len(parts) == 2 and parts[1] in ("pay", "cancel"):
+                return mock_checkout_action(event, parts[0], parts[1], base_url)
         return resp(404, {"error": f"no route {method} {path}"})
     except Exception as e:
         print("ERROR", repr(e))

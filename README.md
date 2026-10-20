@@ -12,6 +12,10 @@ Everything lives in the CloudFormation stack `smart-parking` (ap-south-1) inside
    - `checkout.session.expired`: reservation goes to `EXPIRED` and the lock is released.
 4. Locks auto-expire through their TTL if the webhook never arrives.
 
+## Payment modes
+- **Mock gateway (default, used for the demo).** If `StripeSecretKey` is empty, `/reserve` returns a `checkoutUrl` that points to a simulated hosted checkout page served by the Lambda. The page is clearly labelled as simulated and moves no money. Clicking **Pay** makes the gateway send a Stripe-format `checkout.session.completed` event, HMAC-signed the same way Stripe signs it (`Stripe-Signature: t=..,v1=..`), to the public `/webhook` URL. That means the real webhook path runs: signature check, idempotent confirmation, slot booking and lock release. **Cancel** sends `checkout.session.expired`. Card `4000 0000 0000 0002` simulates a decline (the slot stays locked so the user can retry).
+- **Real Stripe.** Deploy with `StripeSecretKey`/`StripeWebhookSecret` (see below) and the same code calls the Stripe Checkout API instead. The mock routes are then disabled.
+
 ## Endpoints
 | Method | Path | Body |
 |---|---|---|
@@ -21,6 +25,8 @@ Everything lives in the CloudFormation stack `smart-parking` (ap-south-1) inside
 | POST | /release | `{"reservationId":"..."}` |
 | GET | /reservations/{id} | – |
 | POST | /webhook | Stripe event (signed) |
+| GET | /mock-checkout/{reservationId} | – (mock mode: hosted checkout page) |
+| POST | /mock-checkout/{reservationId}/pay \| /cancel | `{"card":"4242 4242 4242 4242"}` |
 
 ## Test
 ```bash
@@ -30,9 +36,9 @@ curl $API/slots
 curl -X POST $API/reserve -H 'content-type: application/json' -d '{"slotId":"A1","userId":"u1"}'
 curl -X POST $API/reserve -H 'content-type: application/json' -d '{"slotId":"A1","userId":"u2"}'   # -> 409 locked
 ```
-Pay with test card `4242 4242 4242 4242`.
+Open the returned `checkoutUrl` in a browser and pay with `4242 4242 4242 4242`. Or run `bash demo.sh` for a guided walkthrough.
 
-## Configure Stripe
+## Configure real Stripe (optional)
 1. In the Stripe test dashboard, go to Developers → Webhooks → Add endpoint. Set the URL to the `WebhookUrl` stack output and select the events `checkout.session.completed` and `checkout.session.expired`.
 2. Run:
 ```bash

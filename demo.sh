@@ -4,7 +4,7 @@ API=$(aws cloudformation describe-stacks --stack-name smart-parking \
   --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" --output text)
 step() { echo; echo "=== $* ==="; read -rp "(enter) "; }
 
-step "1. Seed parking slots into DynamoDB"
+step "1. Seed (or reset) parking slots in DynamoDB"
 curl -s -X POST "$API/seed"; echo
 
 step "2. List slots (status from DynamoDB, live lock state from ElastiCache)"
@@ -21,7 +21,7 @@ step "4. Slot A1 now shows locked=true with a TTL"
 curl -s "$API/slots" | python -c "import json,sys; print([s for s in json.load(sys.stdin) if s['slotId']=='A1'])"
 
 RID=$(python -c "import json; d=json.load(open('/tmp/alice.json')); d=d if 'reservationId' in d else json.load(open('/tmp/bob.json')); print(d['reservationId']); print(d['checkoutUrl'], file=open('/tmp/url','w'))")
-step "5. Open the Stripe checkout URL and pay with 4242 4242 4242 4242"
+step "5. Open this checkout URL in a browser. Try declined card 4000 0000 0000 0002 first, then pay with 4242 4242 4242 4242"
 cat /tmp/url
 
 step "6. After paying: the webhook confirmed the reservation and booked the slot"
