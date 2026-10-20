@@ -1,0 +1,169 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Smart Parking Reservation - API Gateway -> Lambda -> DynamoDB + ElastiCache (Valkey) + Stripe. Isolated VPC.
+
+Parameters:
+  StripeSecretKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+  StripeWebhookSecret:
+    Type: String
+    NoEcho: true
+    Default: ""
+
+Resources:
+  # ---------- Dedicated network (isolated from any existing VPC/EC2) ----------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: parking-vpc }]
+  Igw:
+    Type: AWS::EC2::InternetGateway
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref Igw }
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+  PublicRT:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties: { RouteTableId: !Ref PublicRT, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref Igw }
+  PublicAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet, RouteTableId: !Ref PublicRT }
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties: { Domain: vpc }
+  Nat:
+    Type: AWS::EC2::NatGateway
+    Properties: { AllocationId: !GetAtt NatEip.AllocationId, SubnetId: !Ref PublicSubnet }
+  PrivateRT:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties: { RouteTableId: !Ref PrivateRT, DestinationCidrBlock: 0.0.0.0/0, NatGatewayId: !Ref Nat }
+  PrivAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRT }
+  PrivAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRT }
+  LambdaSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties: { GroupDescription: parking lambda, VpcId: !Ref Vpc }
+  CacheSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: parking cache
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 6379, ToPort: 6379, SourceSecurityGroupId: !Ref LambdaSG }
+
+  # ---------- ElastiCache (Valkey serverless) ----------
+  Cache:
+    Type: AWS::ElastiCache::ServerlessCache
+    Properties:
+      ServerlessCacheName: parking-locks
+      Engine: valkey
+      MajorEngineVersion: "8"
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref CacheSG]
+
+  # ---------- DynamoDB ----------
+  SlotsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: parking-slots
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: slotId, AttributeType: S }]
+      KeySchema: [{ AttributeName: slotId, KeyType: HASH }]
+  ReservationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: parking-reservations
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: reservationId, AttributeType: S }]
+      KeySchema: [{ AttributeName: reservationId, KeyType: HASH }]
+
+  # ---------- Lambda ----------
+  FnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole]
+      Policies:
+        - PolicyName: ddb
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Scan, dynamodb:BatchWriteItem]
+                Resource: [!GetAtt SlotsTable.Arn, !GetAtt ReservationsTable.Arn]
+  Fn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: parking-api
+      Runtime: python3.12
+      Handler: app.handler
+      Timeout: 15
+      MemorySize: 256
+      Role: !GetAtt FnRole.Arn
+      Code:
+        ZipFile: "def handler(e, c): return {'statusCode': 503, 'body': 'code not uploaded yet'}"
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+        SecurityGroupIds: [!Ref LambdaSG]
+      Environment:
+        Variables:
+          SLOTS_TABLE: !Ref SlotsTable
+          RES_TABLE: !Ref ReservationsTable
+          CACHE_HOST: !GetAtt Cache.Endpoint.Address
+          CACHE_PORT: !GetAtt Cache.Endpoint.Port
+          STRIPE_SECRET_KEY: !Ref StripeSecretKey
+          STRIPE_WEBHOOK_SECRET: !Ref StripeWebhookSecret
+
+  # ---------- API Gateway (HTTP API, quick-create proxy to Lambda) ----------
+  Api:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: parking-api
+      ProtocolType: HTTP
+      Target: !GetAtt Fn.Arn
+  ApiInvokePerm:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Fn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*
+
+Outputs:
+  ApiUrl:
+    Value: !GetAtt Api.ApiEndpoint
+  WebhookUrl:
+    Value: !Sub "${Api.ApiEndpoint}/webhook"
