@@ -225,6 +225,8 @@ def seed(_event):
         for zone, prefix in (("Level-1", "A"), ("Level-2", "B")):
             for i in range(1, 6):
                 w.put_item(Item={"slotId": f"{prefix}{i}", "zone": zone, "priceInr": 50 if prefix == "A" else 30, "status": "AVAILABLE"})
+                # Reset also clears any checkout lock left over from a previous run.
+                cache.cmd("DEL", lock_key(f"{prefix}{i}"))
     return resp(200, {"seeded": 10})
 
 

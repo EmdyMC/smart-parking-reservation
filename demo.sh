@@ -20,7 +20,8 @@ echo "bob:";   python -m json.tool /tmp/bob.json
 step "4. Slot A1 now shows locked=true with a TTL"
 curl -s "$API/slots" | python -c "import json,sys; print([s for s in json.load(sys.stdin) if s['slotId']=='A1'])"
 
-RID=$(python -c "import json; d=json.load(open('/tmp/alice.json')); d=d if 'reservationId' in d else json.load(open('/tmp/bob.json')); print(d['reservationId']); print(d['checkoutUrl'], file=open('/tmp/url','w'))")
+RID=$(python -c "import json; d=json.load(open('/tmp/alice.json')); d=d if 'reservationId' in d else json.load(open('/tmp/bob.json')); print(d['reservationId']); print(d['checkoutUrl'], file=open('/tmp/url','w'))" 2>/dev/null) \
+  || { echo "Neither alice nor bob won the lock (stale lock?). Re-run from step 1."; exit 1; }
 step "5. Open this checkout URL in a browser. Try declined card 4000 0000 0000 0002 first, then pay with 4242 4242 4242 4242"
 cat /tmp/url
 
